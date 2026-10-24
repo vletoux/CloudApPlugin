@@ -55,45 +55,76 @@ with `0xC0000718` and unload the plug-in.
 
 ## CloudAPPluginInitialize
 
+All the types are in [`plugin\CloudAp.h`](plugin/CloudAp.h). The prototype is the one of
+`aadcloudap!CloudAPPluginInitialize` (its public symbol is a C++ decorated name, so it carries the
+parameter types and the structure names):
+
 ```c
 NTSTATUS CloudAPPluginInitialize(
-    ULONG       Version,          // 1
-    const GUID* ProviderGuid,
-    PVOID*      CloudApTable,     // callbacks given by cloudAP, see below
-    PULONG      Flags,            // out
-    PWSTR       Name,             // out, WCHAR[21]
-    PSID        Sid,              // out, buffer in cloudAP's record, must pass RtlValidSid
-    PVOID*      Sid2,             // out, optional
-    PVOID*      Reserved,         // out, NULL is fine
-    PVOID       PluginTable);     // out, 0xB0 bytes to FILL, not a pointer to store
+    ULONG Version,                                     // 1
+    GUID* ProviderGuid,
+    PCLOUDAP_SECPKG_FUNCTION_TABLE CloudApFunctions,   // what cloudAP gives the plug-in
+    PULONG Flags,                                      // out
+    PWSTR Name,                                        // out, WCHAR[21]
+    PUCHAR Sid,                                        // out, SID buffer, must pass RtlValidSid
+    PVOID* Sid2,                                       // out, optional
+    PVOID* Context,                                    // out, first argument of every plug-in function
+    PAPPLUGIN_SECPKG_FUNCTION_TABLE PluginFunctions);  // out, 0xB0 bytes to FILL, not a pointer to store
 ```
 
 All the out-parameters point into the 0x188-byte record cloudAP keeps for the plug-in. The last one
 is the easy mistake: cloudAP passes a buffer and the plug-in copies its table into it. Storing a
 pointer there makes cloudAP read garbage and unload the plug-in a few milliseconds later.
+`Context` is whatever the plug-in wants back: cloudAP passes it as the first argument of every slot.
 
 The **name** matters more than it looks. It is how cloudAP finds the plug-in at logon time, and it
 must be the same string as the `Name` value of the `Providers` key (see "Routing").
 
-Useful callbacks in `CloudApTable`:
+Bits of `Flags` that cloudAP tests: `0x01` skips the DPAPI key sync, `0x04` is needed to be chosen
+by the surrogate for a smart card logon, `0x10` makes the plug-in the default one.
 
-| index | function                     | use |
-|-------|------------------------------|-----|
-| 6     | `cloudAP!AllocateUserInfo`   | builds the user info `GetToken` returns |
-| 7     | `cloudAP!FreeUserInfo`       | |
-| 8-10  | `lsasrv!CrediRead/Free/Write`| credential manager |
-| 15    | `LSA_SECPKG_FUNCTION_TABLE`  | `AllocateLsaHeap` for everything cloudAP frees |
+## What cloudAP gives the plug-in
+
+`CLOUDAP_SECPKG_FUNCTION_TABLE` is 15 entries. `cloudAP!SpInitialize` fills it once: most entries are
+copied from the `LSA_SECPKG_FUNCTION_TABLE` LSA gave cloudAP, so they have their typedef in
+`ntsecpkg.h` already. The five others are cloudAP functions, typed from their public symbols.
+
+| # | entry | type | from |
+|---|-------|------|------|
+| 0 | ImpersonateClient | `PLSA_IMPERSONATE_CLIENT` | LSA +0x58 |
+| 1 | LsaProtectMemory | `PLSA_PROTECT_MEMORY` | LSA +0x160 |
+| 2 | LsaUnprotectMemory | `PLSA_PROTECT_MEMORY` | LSA +0x168 |
+| 3 | OpenTokenByLogonId | `PLSA_OPEN_TOKEN_BY_LOGON_ID` | LSA +0x170 |
+| 4 | AllocateLsaHeap | `PLSA_ALLOCATE_LSA_HEAP` | LSA +0x28 |
+| 5 | FreeLsaHeap | `PLSA_FREE_LSA_HEAP` | LSA +0x30 |
+| 6 | AllocateUserInfo | `CLOUDAP_ALLOCATE_USER_INFO*` | cloudAP |
+| 7 | FreeUserInfo | `CLOUDAP_FREE_USER_INFO*` | cloudAP |
+| 8 | CrediRead | `CredReadFn*` | LSA +0x148 |
+| 9 | CrediFreeCredentials | `CredFreeCredentialsFn*` | LSA +0x158 |
+| 10 | CrediWrite | `CredWriteFn*` | LSA +0x198 |
+| 11 | SignMessageWithNgc | `CLOUDAP_SIGN_MESSAGE_WITH_NGC*` | cloudAP |
+| 12 | GetCallInfo | `PLSA_GET_CALL_INFO` | LSA +0xC0 |
+| 13 | GenerateKeyBindingKeyPair | `CLOUDAP_GENERATE_KEY_BINDING_KEY_PAIR*` | cloudAP |
+| 14 | VerifyKeyBindingKeyPair | `CLOUDAP_VERIFY_KEY_BINDING_KEY_PAIR*` | cloudAP |
+
+`CredReadFn`, `CredWriteFn` and `CredFreeCredentialsFn` are in `ntsecpkg.h` but only when `wincred.h`
+is included first; without it, those slots of `LSA_SECPKG_FUNCTION_TABLE` are named
+`DummyFunction1..5`. Right after the table in cloudAP's memory comes `g_pLsaFunctionTable`, a
+different variable: an early version of this plug-in read it as "entry 15" to reach `AllocateLsaHeap`.
+It worked by accident; entry 4 is the real one.
 
 ## The plug-in table
 
-`{ ULONG Version; PVOID Functions[21]; }`. The names are those of the Microsoft plug-ins' symbols:
+`APPLUGIN_SECPKG_FUNCTION_TABLE` = `{ ULONG Version; NoNetwork[9]; NetworkOk[12]; }`: the Microsoft
+plug-ins build it from two static tables, the functions that work without network and the others.
+The names and prototypes come from the aad and MSA symbols (all in `CloudAp.h`):
 
 | slot | function | | slot | function |
 |------|----------|-|------|----------|
 | 0 | Uninitialize | | 11 | **GetKeys** |
 | 1 | ValidateUserInfo | | 12 | LookupSIDFromIdentityName |
 | 2 | GetUnlockKey | | 13 | LookupIdentityFromSIDName |
-| 3 | (MSA only) | | 14 | UserProfileLoaded |
+| 3 | (unnamed, NULL in aad and MSA) | | 14 | UserProfileLoaded |
 | 4 | GetDefaultCredentialComplexity | | 15 | ConnectIdentity |
 | 5 | IsConnected | | 16 | DisconnectIdentity |
 | 6 | AcceptPeerCertificate | | 17 | RenewCertificate |
