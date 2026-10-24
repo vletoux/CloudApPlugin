@@ -1,0 +1,4 @@
+LIBRARY CloudApCp
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
